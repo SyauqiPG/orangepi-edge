@@ -1,0 +1,26 @@
+{
+  "name": "orangepi-edge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Orange Pi Zero 3 edge runtime for ESP32-CAM + MobileNetV4 smart watering",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "onnxruntime-node": "^1.22.0",
+    "sharp": "^0.34.2",
+    "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "supertest": "^7.2.2"
+  }
+}
