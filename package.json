@@ -7,7 +7,11 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "test:inference": "node --test test/deploy/inference-validation.test.js",
+    "test:benchmark": "node --test test/deploy/inference-benchmark.test.js",
+    "test:smoke": "bash test/deploy/smoke.sh",
+    "test:deploy": "npm run test:inference && npm run test:benchmark && npm run test:smoke"
   },
   "engines": {
     "node": ">=20"
