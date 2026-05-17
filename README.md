@@ -79,11 +79,70 @@ ONNX_INDEX_RAIN=1
 
 ## ESP32-CAM Pull Capture
 
-Flash `src/esp32cam.ino` to the AI Thinker ESP32-CAM. It serves:
+Flash `src/esp32cam/esp32cam.ino` to the AI Thinker ESP32-CAM. Arduino CLI requires the `.ino` filename to match its folder name, so the sketch directory is `src/esp32cam`.
 
 - `GET /status`
 - `GET /capture`
 - `GET /stream`
+
+### Flash With Arduino CLI
+
+Install Arduino CLI, then install the ESP32 board package:
+
+```bash
+arduino-cli config init
+arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+arduino-cli core update-index
+arduino-cli core install esp32:esp32
+```
+
+Edit Wi-Fi credentials in `src/esp32cam/esp32cam.ino`:
+
+```cpp
+const char *WIFI_SSID = "YOUR_WIFI_SSID";
+const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+```
+
+Find the serial port:
+
+```bash
+arduino-cli board list
+```
+
+Put the ESP32-CAM into flash mode:
+
+1. Connect `IO0` to `GND`.
+2. Press `RST`.
+3. Keep `IO0` connected while uploading.
+
+Compile and upload. Replace `COM5` with your port, for example `/dev/ttyUSB0` on Linux:
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32cam src/esp32cam
+arduino-cli upload -p COM5 --fqbn esp32:esp32:esp32cam src/esp32cam
+```
+
+If upload gets stuck at `Connecting...`, press `RST` once while the upload command is still running. If high-speed upload is unreliable, retry with a slower upload speed:
+
+```bash
+arduino-cli upload -p COM5 --fqbn esp32:esp32:esp32cam --upload-property upload.speed=115200 src/esp32cam
+```
+
+After upload completes:
+
+1. Disconnect `IO0` from `GND`.
+2. Press `RST`.
+3. Open the serial monitor:
+
+```bash
+arduino-cli monitor -p COM5 -c baudrate=115200
+
+or
+
+arduino-cli monitor -p COM9 -c baudrate=115200 --config dtr=off --config rts=off
+```
+
+Copy the printed URL, for example `http://192.168.1.100`.
 
 Set the printed camera URL in `.env`:
 
