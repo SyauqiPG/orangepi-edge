@@ -1,12 +1,13 @@
 # Orange Pi Edge Runtime
 
-This service is the production starting point for Orange Pi Zero 3 (4GB) with ESP32-CAM image upload and MobileNetV4 inference.
+This service is the production starting point for Orange Pi Zero 3 (4GB) with ESP32-CAM capture, MobileNetV4 inference, and GPIO-relay watering control.
 
 ## Goals
 
 - Keep API contract parity with `mock-API` for HMI compatibility.
-- Add edge-only upload endpoint for ESP32-CAM frames.
+- Pull still images from ESP32-CAM `/capture` and keep upload fallback support.
 - Support real model inference via ONNX Runtime with `mobilenetv4-model.onnx`.
+- Run automatic image capture, retention cleanup, and daily watering policy on the Orange Pi.
 
 ## Current Status
 
@@ -20,7 +21,13 @@ This service is the production starting point for Orange Pi Zero 3 (4GB) with ES
   - `DELETE /api/v1/logs`
   - `POST /api/v1/control/tick`
 - New edge ingestion endpoint is available:
+  - `POST /api/v1/camera/snap` (backend pulls `${ESP32_CAM_BASE_URL}/capture`)
   - `POST /api/v1/device/upload` (multipart form field `image`)
+- Watering production endpoints are available:
+  - `GET /api/v1/watering/schedule`
+  - `PUT /api/v1/watering/schedule` with `{ "auto_watering_time": "HH:MM" }`
+  - `GET /api/v1/inference/history?limit=100`
+  - `GET /api/v1/watering/history?limit=100`
 - ONNX runtime inference path is implemented:
   - Provider: `MODEL_PROVIDER=onnx`
   - Model file: `./models/mobilenetv4-model.onnx`
@@ -51,6 +58,8 @@ See `env.example`.
 Important:
 
 - `DEVICE_UPLOAD_KEY` secures ESP32-CAM upload route via `x-device-key` header.
+- `ESP32_CAM_BASE_URL` points to the ESP32-CAM capture server, for example `http://192.168.1.100`.
+- `PUMP_DRY_RUN=true` keeps watering commands in dry-run mode. Set it to `false` and provide `PUMP_ON_COMMAND` / `PUMP_OFF_COMMAND` for the GPIO relay.
 - `MODEL_PROVIDER=onnx` uses direct ONNX Runtime inference.
 - If ONNX loading or execution fails and `ONNX_FALLBACK_TO_MOCK=true`, service falls back to simulated inference.
 
@@ -68,7 +77,29 @@ ONNX_INDEX_RAIN=1
 
 3. Start the service and check startup logs for model load confirmation.
 
-## Upload From ESP32-CAM (HTTP multipart)
+## ESP32-CAM Pull Capture
+
+Flash `src/esp32cam.ino` to the AI Thinker ESP32-CAM. It serves:
+
+- `GET /status`
+- `GET /capture`
+- `GET /stream`
+
+Set the printed camera URL in `.env`:
+
+```env
+ESP32_CAM_BASE_URL=http://192.168.1.100
+```
+
+Then trigger one backend capture and analysis:
+
+```bash
+curl -X POST http://localhost:4000/api/v1/camera/snap
+```
+
+The scheduler also pulls from `/capture` every 10 minutes during local hours 08:00-16:00.
+
+## Upload Fallback (HTTP multipart)
 
 - Endpoint: `POST /api/v1/device/upload`
 - Headers:
@@ -105,5 +136,7 @@ docker compose up -d --build
 ## Notes
 
 - Uploaded images are served from `/uploads/<filename>`.
+- Uploaded images and inference rows older than `IMAGE_RETENTION_DAYS` are removed automatically.
+- Automatic watering runs once daily at `auto_watering_time` and skips when any `rain_likely` inference exists since local midnight.
 - SQLite tables maintain mock parity for `system_state`, `inference_snapshots`, and `watering_logs`.
 - Additional table `image_uploads` tracks ESP32-CAM uploads.

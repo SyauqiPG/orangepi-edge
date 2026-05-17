@@ -7,6 +7,14 @@ function parseNumber(rawValue, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+function parseBoolean(rawValue, fallback) {
+  if (rawValue === undefined || rawValue === null || rawValue === "") {
+    return fallback
+  }
+
+  return ["1", "true", "yes", "on"].includes(String(rawValue).toLowerCase())
+}
+
 function resolveFromRoot(rootDir, rawValue, fallbackRelative) {
   const value = rawValue || fallbackRelative
   if (path.isAbsolute(value)) {
@@ -39,6 +47,17 @@ function loadConfig() {
     CORS_ORIGIN: process.env.CORS_ORIGIN || "*",
     DEVICE_UPLOAD_KEY: process.env.DEVICE_UPLOAD_KEY || "",
     MAX_UPLOAD_BYTES: parseNumber(process.env.MAX_UPLOAD_BYTES, 2 * 1024 * 1024),
+    ESP32_CAM_BASE_URL: (process.env.ESP32_CAM_BASE_URL || "").replace(/\/+$/, ""),
+    ESP32_CAM_TIMEOUT_MS: parseNumber(process.env.ESP32_CAM_TIMEOUT_MS, 15_000),
+    IMAGE_RETENTION_DAYS: parseNumber(process.env.IMAGE_RETENTION_DAYS, 7),
+    APP_TIMEZONE: process.env.APP_TIMEZONE || "Asia/Jakarta",
+    AUTO_SNAP_INTERVAL_MS: parseNumber(process.env.AUTO_SNAP_INTERVAL_MS, 600_000),
+    DAYLIGHT_START_HOUR: parseNumber(process.env.DAYLIGHT_START_HOUR, 8),
+    DAYLIGHT_END_HOUR: parseNumber(process.env.DAYLIGHT_END_HOUR, 16),
+    WATERING_DURATION_MS: parseNumber(process.env.WATERING_DURATION_MS, 5_000),
+    PUMP_DRY_RUN: parseBoolean(process.env.PUMP_DRY_RUN, true),
+    PUMP_ON_COMMAND: process.env.PUMP_ON_COMMAND || "",
+    PUMP_OFF_COMMAND: process.env.PUMP_OFF_COMMAND || "",
     MODEL_PROVIDER: process.env.MODEL_PROVIDER || "onnx",
     MODEL_COMMAND: process.env.MODEL_COMMAND || "",
     MODEL_COMMAND_TIMEOUT_MS: parseNumber(process.env.MODEL_COMMAND_TIMEOUT_MS, 12_000),

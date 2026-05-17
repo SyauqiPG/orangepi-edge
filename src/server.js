@@ -34,8 +34,142 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value))
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+function runShellCommand(command, config) {
+  if (!command) {
+    return Promise.resolve()
+  }
+
+  return new Promise((resolve, reject) => {
+    exec(
+      command,
+      {
+        cwd: config.ROOT_DIR,
+        timeout: Math.max(config.WATERING_DURATION_MS + 10_000, 15_000),
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error((stderr || error.message).trim()))
+          return
+        }
+
+        resolve(stdout)
+      }
+    )
+  })
+}
+
 function toLogDescription(mode) {
   return mode === "manual" ? "Manually" : "Automatically"
+}
+
+function normalizeScheduleTime(rawValue) {
+  const value = String(rawValue || "").trim()
+  const match = value.match(/^([01]\d|2[0-3]):([0-5]\d)$/)
+  return match ? value : null
+}
+
+function getLocalParts(date, timeZone) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  })
+
+  const values = {}
+  for (const part of formatter.formatToParts(date)) {
+    if (part.type !== "literal") {
+      values[part.type] = Number(part.value)
+    }
+  }
+
+  return values
+}
+
+function getTimeZoneOffsetMs(date, timeZone) {
+  const parts = getLocalParts(date, timeZone)
+  const asUtc = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second
+  )
+  return asUtc - date.getTime()
+}
+
+function localDateTimeToUtcDate({ year, month, day, hour = 0, minute = 0, second = 0 }, timeZone) {
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, second)
+  const offset = getTimeZoneOffsetMs(new Date(utcGuess), timeZone)
+  return new Date(utcGuess - offset)
+}
+
+function getLocalDateKey(date, timeZone) {
+  const parts = getLocalParts(date, timeZone)
+  return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`
+}
+
+function getLocalMidnightIso(date, timeZone) {
+  const parts = getLocalParts(date, timeZone)
+  return localDateTimeToUtcDate(
+    {
+      year: parts.year,
+      month: parts.month,
+      day: parts.day,
+    },
+    timeZone
+  ).toISOString()
+}
+
+function computeNextAutoWateringAt(scheduleTime, fromDate, timeZone) {
+  const normalized = normalizeScheduleTime(scheduleTime)
+  if (!normalized) {
+    return null
+  }
+
+  const [hour, minute] = normalized.split(":").map(Number)
+  const parts = getLocalParts(fromDate, timeZone)
+  let candidate = localDateTimeToUtcDate(
+    {
+      year: parts.year,
+      month: parts.month,
+      day: parts.day,
+      hour,
+      minute,
+    },
+    timeZone
+  )
+
+  if (candidate.getTime() <= fromDate.getTime()) {
+    candidate = localDateTimeToUtcDate(
+      {
+        year: parts.year,
+        month: parts.month,
+        day: parts.day + 1,
+        hour,
+        minute,
+      },
+      timeZone
+    )
+  }
+
+  return candidate
+}
+
+function isWithinDaylightWindow(date, config) {
+  const parts = getLocalParts(date, config.APP_TIMEZONE)
+  return parts.hour >= config.DAYLIGHT_START_HOUR && parts.hour <= config.DAYLIGHT_END_HOUR
 }
 
 function buildDescription(label, confidence) {
@@ -92,13 +226,22 @@ function safeImageExtension(originalName, mimeType) {
   return ".jpg"
 }
 
+function imageExtensionFromContentType(contentType) {
+  const lowered = String(contentType || "").toLowerCase()
+  if (lowered.includes("png")) {
+    return ".png"
+  }
+
+  if (lowered.includes("webp")) {
+    return ".webp"
+  }
+
+  return ".jpg"
+}
+
 function toAbsoluteImagePath(config, imagePath) {
   if (!imagePath) {
     return ""
-  }
-
-  if (path.isAbsolute(imagePath)) {
-    return imagePath
   }
 
   const normalizedBase = config.SNAPSHOT_IMAGE_BASE_PATH.endsWith("/")
@@ -108,6 +251,10 @@ function toAbsoluteImagePath(config, imagePath) {
   if (imagePath.startsWith(`${normalizedBase}/`)) {
     const relativePart = imagePath.slice(normalizedBase.length + 1)
     return path.join(config.IMAGE_UPLOAD_DIR, relativePart)
+  }
+
+  if (path.isAbsolute(imagePath)) {
+    return imagePath
   }
 
   return path.resolve(config.ROOT_DIR, imagePath)
@@ -245,6 +392,9 @@ function createServer(configOverrides = {}) {
 
   const db = new sqlite3.Database(config.DB_PATH)
   let initializationPromise = null
+  let wateringInProgress = false
+  let schedulerTimer = null
+  let cleanupTimer = null
 
   const app = express()
   app.use(cors({ origin: parseCorsOrigin(config.CORS_ORIGIN) }))
@@ -328,6 +478,14 @@ function createServer(configOverrides = {}) {
     })
   }
 
+  async function ensureColumn(tableName, columnName, definition) {
+    const columns = await all(`PRAGMA table_info(${tableName})`)
+    const exists = columns.some((column) => column.name === columnName)
+    if (!exists) {
+      await run(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`)
+    }
+  }
+
   async function initializeDatabase() {
     await run(`
       CREATE TABLE IF NOT EXISTS system_state (
@@ -337,7 +495,12 @@ function createServer(configOverrides = {}) {
         image_path TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         last_manual_watering_at TEXT,
-        last_auto_watering_at TEXT
+        last_auto_watering_at TEXT,
+        auto_watering_time TEXT NOT NULL DEFAULT '07:00',
+        last_auto_snap_at TEXT,
+        last_auto_watering_date TEXT,
+        skipped_auto_watering_at TEXT,
+        last_cleanup_at TEXT
       )
     `)
 
@@ -377,13 +540,32 @@ function createServer(configOverrides = {}) {
       )
     `)
 
+    await ensureColumn("system_state", "auto_watering_time", "TEXT NOT NULL DEFAULT '07:00'")
+    await ensureColumn("system_state", "last_auto_snap_at", "TEXT")
+    await ensureColumn("system_state", "last_auto_watering_date", "TEXT")
+    await ensureColumn("system_state", "skipped_auto_watering_at", "TEXT")
+    await ensureColumn("system_state", "last_cleanup_at", "TEXT")
+
     const state = await get("SELECT * FROM system_state WHERE id = 1")
     if (!state) {
       const timestamp = nowIso()
       await run(
         `
-        INSERT INTO system_state (id, status, mode, image_path, updated_at, last_manual_watering_at, last_auto_watering_at)
-        VALUES (1, 'online', 'auto', ?, ?, NULL, NULL)
+        INSERT INTO system_state (
+          id,
+          status,
+          mode,
+          image_path,
+          updated_at,
+          last_manual_watering_at,
+          last_auto_watering_at,
+          auto_watering_time,
+          last_auto_snap_at,
+          last_auto_watering_date,
+          skipped_auto_watering_at,
+          last_cleanup_at
+        )
+        VALUES (1, 'online', 'auto', ?, ?, NULL, NULL, '07:00', NULL, NULL, NULL, NULL)
         `,
         ["/sky-monitor.svg", timestamp]
       )
@@ -393,6 +575,8 @@ function createServer(configOverrides = {}) {
     if (!latestSnapshot) {
       await createAndPersistSnapshot()
     }
+
+    await cleanupOldImagesAndRows()
   }
 
   async function ensureInitialized() {
@@ -426,7 +610,18 @@ function createServer(configOverrides = {}) {
     await run(
       `
       UPDATE system_state
-      SET status = ?, mode = ?, image_path = ?, updated_at = ?, last_manual_watering_at = ?, last_auto_watering_at = ?
+      SET
+        status = ?,
+        mode = ?,
+        image_path = ?,
+        updated_at = ?,
+        last_manual_watering_at = ?,
+        last_auto_watering_at = ?,
+        auto_watering_time = ?,
+        last_auto_snap_at = ?,
+        last_auto_watering_date = ?,
+        skipped_auto_watering_at = ?,
+        last_cleanup_at = ?
       WHERE id = 1
       `,
       [
@@ -436,6 +631,11 @@ function createServer(configOverrides = {}) {
         next.updated_at,
         next.last_manual_watering_at || null,
         next.last_auto_watering_at || null,
+        next.auto_watering_time || "07:00",
+        next.last_auto_snap_at || null,
+        next.last_auto_watering_date || null,
+        next.skipped_auto_watering_at || null,
+        next.last_cleanup_at || null,
       ]
     )
 
@@ -445,6 +645,108 @@ function createServer(configOverrides = {}) {
   async function getLatestUploadedImagePath() {
     const latestUpload = await get("SELECT image_path FROM image_uploads ORDER BY id DESC LIMIT 1")
     return latestUpload ? latestUpload.image_path : null
+  }
+
+  async function persistImageUpload({ deviceId, imagePath, capturedAt, uploadedAt }) {
+    await run(
+      `
+      INSERT INTO image_uploads (device_id, image_path, captured_at, uploaded_at)
+      VALUES (?, ?, ?, ?)
+      `,
+      [deviceId, imagePath, capturedAt, uploadedAt]
+    )
+  }
+
+  async function saveCameraCapture(buffer, contentType, capturedAt = nowIso()) {
+    ensureDirectory(config.IMAGE_UPLOAD_DIR)
+    const extension = imageExtensionFromContentType(contentType)
+    const randomSuffix = Math.random().toString(36).slice(2, 10)
+    const filename = `${Date.now()}-${randomSuffix}${extension}`
+    const absolutePath = path.join(config.IMAGE_UPLOAD_DIR, filename)
+    await fs.promises.writeFile(absolutePath, buffer)
+
+    return {
+      imagePath: path.posix.join(config.SNAPSHOT_IMAGE_BASE_PATH.replace(/\\/g, "/"), filename),
+      absolutePath,
+      capturedAt,
+    }
+  }
+
+  async function fetchCameraCapture() {
+    if (!config.ESP32_CAM_BASE_URL) {
+      const error = new Error("ESP32_CAM_BASE_URL is not configured")
+      error.statusCode = 400
+      throw error
+    }
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), config.ESP32_CAM_TIMEOUT_MS)
+
+    try {
+      const response = await fetch(`${config.ESP32_CAM_BASE_URL}/capture?ts=${Date.now()}`, {
+        cache: "no-store",
+        signal: controller.signal,
+      })
+
+      if (!response.ok) {
+        const error = new Error(`ESP32-CAM capture returned HTTP ${response.status}`)
+        error.statusCode = 502
+        throw error
+      }
+
+      const contentType = response.headers.get("content-type") || ""
+      if (!contentType.toLowerCase().startsWith("image/")) {
+        const error = new Error("ESP32-CAM capture did not return an image")
+        error.statusCode = 502
+        throw error
+      }
+
+      const arrayBuffer = await response.arrayBuffer()
+      const buffer = Buffer.from(arrayBuffer)
+      if (buffer.length === 0) {
+        const error = new Error("ESP32-CAM capture returned an empty image")
+        error.statusCode = 502
+        throw error
+      }
+
+      return {
+        buffer,
+        contentType,
+      }
+    } catch (error) {
+      if (error && error.name === "AbortError") {
+        const timeoutError = new Error("ESP32-CAM capture timed out")
+        timeoutError.statusCode = 504
+        throw timeoutError
+      }
+
+      throw error
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  async function captureFromCameraAndAnalyze({ deviceId = "esp32-cam", markAutoSnap = false } = {}) {
+    const capture = await fetchCameraCapture()
+    const timestamp = nowIso()
+    const saved = await saveCameraCapture(capture.buffer, capture.contentType, timestamp)
+
+    await persistImageUpload({
+      deviceId,
+      imagePath: saved.imagePath,
+      capturedAt: saved.capturedAt,
+      uploadedAt: timestamp,
+    })
+
+    const snapshot = await refreshSnapshotIfNeeded(true, saved.imagePath)
+    if (markAutoSnap) {
+      await updateState({ last_auto_snap_at: timestamp })
+    }
+
+    return {
+      imagePath: saved.imagePath,
+      snapshot,
+    }
   }
 
   async function createAndPersistSnapshot(referenceTime = Date.now(), preferredImagePath = null) {
@@ -513,7 +815,52 @@ function createServer(configOverrides = {}) {
     }
   }
 
+  function inferenceHistoryToResponse(row) {
+    return {
+      id: String(row.id),
+      date: row.updated_at,
+      confidence: row.prediction_confidence,
+      verdict: row.prediction_label,
+      image_url: row.image_path,
+    }
+  }
+
+  function wateringHistoryToResponse(row) {
+    const watered = row.activity === "Plant Watered"
+    return {
+      id: String(row.id),
+      date: row.date_time,
+      activity: watered ? "watered" : "not_watered",
+      description: row.mode === "manual" ? "manual_override" : "automatic",
+      note: row.note || undefined,
+    }
+  }
+
+  async function cleanupOldImagesAndRows(referenceDate = new Date()) {
+    const retentionMs = Math.max(config.IMAGE_RETENTION_DAYS, 1) * 24 * 60 * 60 * 1000
+    const cutoffDate = new Date(referenceDate.getTime() - retentionMs)
+    const cutoffIso = cutoffDate.toISOString()
+
+    const oldUploads = await all(
+      "SELECT id, image_path FROM image_uploads WHERE uploaded_at < ?",
+      [cutoffIso]
+    )
+
+    for (const uploadRow of oldUploads) {
+      const absolutePath = toAbsoluteImagePath(config, uploadRow.image_path)
+      const relativePath = path.relative(config.IMAGE_UPLOAD_DIR, absolutePath)
+      if (relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+        await fs.promises.rm(absolutePath, { force: true })
+      }
+    }
+
+    await run("DELETE FROM image_uploads WHERE uploaded_at < ?", [cutoffIso])
+    await run("DELETE FROM inference_snapshots WHERE updated_at < ?", [cutoffIso])
+    await updateState({ last_cleanup_at: referenceDate.toISOString() })
+  }
+
   async function createWateringLog({
+    activity = "Plant Watered",
     description,
     mode,
     predictionLabel,
@@ -532,10 +879,11 @@ function createServer(configOverrides = {}) {
         prediction_label,
         prediction_confidence,
         note
-      ) VALUES (?, 'Plant Watered', ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
       `,
       [
         timestamp,
+        activity,
         description,
         mode,
         predictionLabel || null,
@@ -547,36 +895,66 @@ function createServer(configOverrides = {}) {
     return get("SELECT * FROM watering_logs WHERE id = ?", [result.lastID])
   }
 
+  async function runWateringHardware() {
+    if (wateringInProgress) {
+      const error = new Error("Watering is already in progress")
+      error.statusCode = 409
+      throw error
+    }
+
+    wateringInProgress = true
+    try {
+      if (config.PUMP_DRY_RUN) {
+        return {
+          dryRun: true,
+          durationMs: config.WATERING_DURATION_MS,
+        }
+      }
+
+      if (!config.PUMP_ON_COMMAND || !config.PUMP_OFF_COMMAND) {
+        const error = new Error("Pump commands are not configured")
+        error.statusCode = 503
+        throw error
+      }
+
+      await runShellCommand(config.PUMP_ON_COMMAND, config)
+      try {
+        await sleep(config.WATERING_DURATION_MS)
+      } finally {
+        await runShellCommand(config.PUMP_OFF_COMMAND, config)
+      }
+
+      return {
+        dryRun: false,
+        durationMs: config.WATERING_DURATION_MS,
+      }
+    } finally {
+      wateringInProgress = false
+    }
+  }
+
+  function nextAutomaticWateringIsUnderSixHours(state) {
+    const nextSchedule = computeNextAutoWateringAt(
+      state.auto_watering_time,
+      new Date(),
+      config.APP_TIMEZONE
+    )
+
+    if (!nextSchedule) {
+      return {
+        shouldCancel: false,
+        nextSchedule: null,
+      }
+    }
+
+    return {
+      shouldCancel: nextSchedule.getTime() - Date.now() < 6 * 60 * 60 * 1000,
+      nextSchedule,
+    }
+  }
+
   async function maybeAutoWater(snapshot, state) {
-    if (state.status !== "online" || state.mode !== "auto") {
-      return null
-    }
-
-    if (snapshot.prediction_label !== "rain_unlikely") {
-      return null
-    }
-
-    if (snapshot.prediction_confidence < 0.7) {
-      return null
-    }
-
-    const now = Date.now()
-    const lastAuto = state.last_auto_watering_at ? Date.parse(state.last_auto_watering_at) : 0
-
-    if (now - lastAuto < config.AUTO_WATER_COOLDOWN_MS) {
-      return null
-    }
-
-    const entry = await createWateringLog({
-      description: "Automatically",
-      mode: "auto",
-      predictionLabel: snapshot.prediction_label,
-      predictionConfidence: snapshot.prediction_confidence,
-      note: "Auto policy triggered by rain_unlikely with high confidence.",
-    })
-
-    await updateState({ last_auto_watering_at: nowIso() })
-    return entry
+    return null
   }
 
   async function refreshSnapshotIfNeeded(forceNew = false, preferredImagePath = null) {
@@ -596,6 +974,161 @@ function createServer(configOverrides = {}) {
 
     const freshState = await getState()
     return snapshotToResponse(snapshot, freshState)
+  }
+
+  async function hasRainDetectedToday(referenceDate = new Date()) {
+    const midnightIso = getLocalMidnightIso(referenceDate, config.APP_TIMEZONE)
+    const rainRow = await get(
+      `
+      SELECT id
+      FROM inference_snapshots
+      WHERE updated_at >= ? AND prediction_label = 'rain_likely'
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [midnightIso]
+    )
+
+    return Boolean(rainRow)
+  }
+
+  async function runAutomaticWateringIfDue(referenceDate = new Date()) {
+    const state = await getState()
+    if (state.status !== "online" || state.mode !== "auto") {
+      return null
+    }
+
+    const scheduleTime = normalizeScheduleTime(state.auto_watering_time)
+    if (!scheduleTime) {
+      return null
+    }
+
+    const todayKey = getLocalDateKey(referenceDate, config.APP_TIMEZONE)
+    if (state.last_auto_watering_date === todayKey) {
+      return null
+    }
+
+    const [scheduleHour, scheduleMinute] = scheduleTime.split(":").map(Number)
+    const parts = getLocalParts(referenceDate, config.APP_TIMEZONE)
+    const hasReachedSchedule =
+      parts.hour > scheduleHour || (parts.hour === scheduleHour && parts.minute >= scheduleMinute)
+
+    if (!hasReachedSchedule) {
+      return null
+    }
+
+    const scheduledAt = localDateTimeToUtcDate(
+      {
+        year: parts.year,
+        month: parts.month,
+        day: parts.day,
+        hour: scheduleHour,
+        minute: scheduleMinute,
+      },
+      config.APP_TIMEZONE
+    ).toISOString()
+
+    const latestSnapshot = await getLatestSnapshot()
+    const predictionLabel = latestSnapshot ? latestSnapshot.prediction_label : null
+    const predictionConfidence = latestSnapshot ? latestSnapshot.prediction_confidence : null
+
+    if (state.skipped_auto_watering_at === scheduledAt) {
+      const entry = await createWateringLog({
+        activity: "Plant Not Watered",
+        description: "Automatically",
+        mode: "auto",
+        predictionLabel,
+        predictionConfidence,
+        note: "Automatic watering cancelled because manual watering occurred within 6 hours.",
+      })
+      await updateState({
+        last_auto_watering_at: nowIso(),
+        last_auto_watering_date: todayKey,
+        skipped_auto_watering_at: null,
+      })
+      return entry
+    }
+
+    if (await hasRainDetectedToday(referenceDate)) {
+      const entry = await createWateringLog({
+        activity: "Plant Not Watered",
+        description: "Automatically",
+        mode: "auto",
+        predictionLabel,
+        predictionConfidence,
+        note: "Automatic watering skipped because rain was detected today.",
+      })
+      await updateState({
+        last_auto_watering_at: nowIso(),
+        last_auto_watering_date: todayKey,
+      })
+      return entry
+    }
+
+    await runWateringHardware()
+    const entry = await createWateringLog({
+      description: "Automatically",
+      mode: "auto",
+      predictionLabel,
+      predictionConfidence,
+      note: config.PUMP_DRY_RUN
+        ? "Automatic watering executed in pump dry-run mode."
+        : "Automatic watering executed by GPIO relay command.",
+    })
+
+    await updateState({
+      last_auto_watering_at: nowIso(),
+      last_auto_watering_date: todayKey,
+    })
+    return entry
+  }
+
+  async function runScheduledTasks(referenceDate = new Date()) {
+    const state = await getState()
+
+    if (isWithinDaylightWindow(referenceDate, config) && config.ESP32_CAM_BASE_URL) {
+      const lastAutoSnap = state.last_auto_snap_at ? Date.parse(state.last_auto_snap_at) : 0
+      if (!lastAutoSnap || referenceDate.getTime() - lastAutoSnap >= config.AUTO_SNAP_INTERVAL_MS) {
+        await captureFromCameraAndAnalyze({ deviceId: "esp32-cam", markAutoSnap: true })
+      }
+    }
+
+    await runAutomaticWateringIfDue(referenceDate)
+
+    const lastCleanup = state.last_cleanup_at ? Date.parse(state.last_cleanup_at) : 0
+    if (!lastCleanup || referenceDate.getTime() - lastCleanup >= 24 * 60 * 60 * 1000) {
+      await cleanupOldImagesAndRows(referenceDate)
+    }
+  }
+
+  function startSchedulers() {
+    if (!schedulerTimer) {
+      schedulerTimer = setInterval(() => {
+        runScheduledTasks().catch((error) => {
+          console.warn("[orangepi-edge] Scheduled task failed:", error.message)
+        })
+      }, 30_000)
+    }
+
+    if (!cleanupTimer) {
+      cleanupTimer = setInterval(() => {
+        cleanupOldImagesAndRows().catch((error) => {
+          console.warn("[orangepi-edge] Retention cleanup failed:", error.message)
+        })
+      }, 24 * 60 * 60 * 1000)
+    }
+  }
+
+  function stopSchedulers() {
+    if (schedulerTimer) {
+      clearInterval(schedulerTimer)
+      schedulerTimer = null
+    }
+
+    if (cleanupTimer) {
+      clearInterval(cleanupTimer)
+      cleanupTimer = null
+    }
   }
 
   function requireDeviceKey(req, res, next) {
@@ -629,6 +1162,10 @@ function createServer(configOverrides = {}) {
         logs: "/api/v1/logs",
         tick: "/api/v1/control/tick",
         deviceUpload: "/api/v1/device/upload",
+        cameraSnap: "/api/v1/camera/snap",
+        wateringSchedule: "/api/v1/watering/schedule",
+        inferenceHistory: "/api/v1/inference/history",
+        wateringHistory: "/api/v1/watering/history",
       },
     })
   })
@@ -643,6 +1180,10 @@ function createServer(configOverrides = {}) {
         db_path: config.DB_PATH,
         inference_interval_ms: config.INFERENCE_INTERVAL_MS,
         auto_water_cooldown_ms: config.AUTO_WATER_COOLDOWN_MS,
+        auto_watering_time: state.auto_watering_time,
+        app_timezone: config.APP_TIMEZONE,
+        esp32_cam_configured: Boolean(config.ESP32_CAM_BASE_URL),
+        pump_dry_run: config.PUMP_DRY_RUN,
       })
     } catch (error) {
       next(error)
@@ -662,6 +1203,22 @@ function createServer(configOverrides = {}) {
     try {
       const snapshot = await refreshSnapshotIfNeeded(true)
       res.json({ ok: true, snapshot })
+    } catch (error) {
+      next(error)
+    }
+  })
+
+  app.post("/api/v1/camera/snap", async (req, res, next) => {
+    try {
+      const result = await captureFromCameraAndAnalyze({
+        deviceId: req.body && req.body.device_id ? String(req.body.device_id).slice(0, 64) : "esp32-cam",
+      })
+
+      res.status(201).json({
+        ok: true,
+        image_path: result.imagePath,
+        snapshot: result.snapshot,
+      })
     } catch (error) {
       next(error)
     }
@@ -723,6 +1280,61 @@ function createServer(configOverrides = {}) {
     }
   })
 
+  app.get("/api/v1/watering/schedule", async (req, res, next) => {
+    try {
+      const state = await getState()
+      const nextSchedule = computeNextAutoWateringAt(
+        state.auto_watering_time,
+        new Date(),
+        config.APP_TIMEZONE
+      )
+
+      res.json({
+        auto_watering_time: state.auto_watering_time,
+        next_auto_watering_at: nextSchedule ? nextSchedule.toISOString() : null,
+        skipped_auto_watering_at: state.skipped_auto_watering_at,
+        timezone: config.APP_TIMEZONE,
+      })
+    } catch (error) {
+      next(error)
+    }
+  })
+
+  app.put("/api/v1/watering/schedule", async (req, res, next) => {
+    try {
+      const autoWateringTime = normalizeScheduleTime(
+        req.body ? req.body.auto_watering_time || req.body.time : null
+      )
+
+      if (!autoWateringTime) {
+        res.status(400).json({
+          error: "Invalid auto_watering_time",
+          detail: "Use 24-hour HH:MM format.",
+        })
+        return
+      }
+
+      const state = await updateState({
+        auto_watering_time: autoWateringTime,
+        skipped_auto_watering_at: null,
+      })
+      const nextSchedule = computeNextAutoWateringAt(
+        state.auto_watering_time,
+        new Date(),
+        config.APP_TIMEZONE
+      )
+
+      res.json({
+        ok: true,
+        auto_watering_time: state.auto_watering_time,
+        next_auto_watering_at: nextSchedule ? nextSchedule.toISOString() : null,
+        timezone: config.APP_TIMEZONE,
+      })
+    } catch (error) {
+      next(error)
+    }
+  })
+
   app.post("/api/v1/watering/manual", async (req, res, next) => {
     try {
       const state = await getState()
@@ -743,20 +1355,35 @@ function createServer(configOverrides = {}) {
       }
 
       const snapshot = await refreshSnapshotIfNeeded(false)
+      const cancellation = nextAutomaticWateringIsUnderSixHours(state)
+      await runWateringHardware()
       const entry = await createWateringLog({
         description: toLogDescription("manual"),
         mode: "manual",
         predictionLabel: snapshot.prediction_label,
         predictionConfidence: snapshot.prediction_confidence,
-        note: "Manual TURN ON command from HMI.",
+        note: config.PUMP_DRY_RUN
+          ? "Manual TURN ON command from HMI executed in pump dry-run mode."
+          : "Manual TURN ON command from HMI executed by GPIO relay command.",
       })
 
-      await updateState({ last_manual_watering_at: nowIso() })
+      await updateState({
+        last_manual_watering_at: nowIso(),
+        skipped_auto_watering_at:
+          cancellation.shouldCancel && cancellation.nextSchedule
+            ? cancellation.nextSchedule.toISOString()
+            : state.skipped_auto_watering_at,
+      })
 
       res.json({
         ok: true,
         entry: logToResponse(entry),
         snapshot,
+        cancelled_next_auto_watering: cancellation.shouldCancel,
+        skipped_auto_watering_at:
+          cancellation.shouldCancel && cancellation.nextSchedule
+            ? cancellation.nextSchedule.toISOString()
+            : null,
       })
     } catch (error) {
       next(error)
@@ -779,6 +1406,46 @@ function createServer(configOverrides = {}) {
       )
 
       res.json({ logs: rows.map(logToResponse) })
+    } catch (error) {
+      next(error)
+    }
+  })
+
+  app.get("/api/v1/inference/history", async (req, res, next) => {
+    try {
+      const limitRaw = Number((req.query && req.query.limit) || 100)
+      const limit = Number.isFinite(limitRaw) ? clamp(Math.trunc(limitRaw), 1, 500) : 100
+      const rows = await all(
+        `
+        SELECT id, updated_at, prediction_confidence, prediction_label, image_path
+        FROM inference_snapshots
+        ORDER BY id DESC
+        LIMIT ?
+        `,
+        [limit]
+      )
+
+      res.json({ history: rows.map(inferenceHistoryToResponse) })
+    } catch (error) {
+      next(error)
+    }
+  })
+
+  app.get("/api/v1/watering/history", async (req, res, next) => {
+    try {
+      const limitRaw = Number((req.query && req.query.limit) || 100)
+      const limit = Number.isFinite(limitRaw) ? clamp(Math.trunc(limitRaw), 1, 500) : 100
+      const rows = await all(
+        `
+        SELECT id, date_time, activity, description, mode, note
+        FROM watering_logs
+        ORDER BY id DESC
+        LIMIT ?
+        `,
+        [limit]
+      )
+
+      res.json({ history: rows.map(wateringHistoryToResponse) })
     } catch (error) {
       next(error)
     }
@@ -822,13 +1489,12 @@ function createServer(configOverrides = {}) {
         const rawDeviceId = req.body && req.body.device_id ? req.body.device_id : req.get("x-device-id")
         const deviceId = String(rawDeviceId || "esp32-cam").slice(0, 64)
 
-        await run(
-          `
-          INSERT INTO image_uploads (device_id, image_path, captured_at, uploaded_at)
-          VALUES (?, ?, ?, ?)
-          `,
-          [deviceId, imagePath, capturedAt, uploadedAt]
-        )
+        await persistImageUpload({
+          deviceId,
+          imagePath,
+          capturedAt,
+          uploadedAt,
+        })
 
         const snapshot = await refreshSnapshotIfNeeded(true, imagePath)
 
@@ -863,7 +1529,7 @@ function createServer(configOverrides = {}) {
     if (error && error.statusCode && Number.isInteger(error.statusCode)) {
       res.status(error.statusCode).json({
         error: error.message || "Request failed",
-        detail: error.detail || "Upload validation failed",
+        detail: error.detail || error.message || "Request failed",
       })
       return
     }
@@ -899,12 +1565,14 @@ function createServer(configOverrides = {}) {
         console.log(`[orangepi-edge] Running on http://localhost:${config.PORT}`)
         console.log(`[orangepi-edge] SQLite database: ${config.DB_PATH}`)
         console.log(`[orangepi-edge] Upload directory: ${config.IMAGE_UPLOAD_DIR}`)
+        startSchedulers()
         resolve(server)
       })
     })
   }
 
   async function closeDatabase() {
+    stopSchedulers()
     return new Promise((resolve, reject) => {
       db.close((error) => {
         if (error) {
@@ -921,11 +1589,20 @@ function createServer(configOverrides = {}) {
     app,
     config,
     ensureInitialized,
+    runScheduledTasks,
+    runAutomaticWateringIfDue,
+    cleanupOldImagesAndRows,
     startServer,
+    stopSchedulers,
     closeDatabase,
   }
 }
 
 module.exports = {
   createServer,
+  computeNextAutoWateringAt,
+  getLocalDateKey,
+  getLocalMidnightIso,
+  isWithinDaylightWindow,
+  normalizeScheduleTime,
 }

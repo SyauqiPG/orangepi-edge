@@ -1,34 +1,17 @@
+#include "Arduino.h"
 #include "esp_camera.h"
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <time.h>
+#include "esp_http_server.h"
+#include "WiFi.h"
 
-// ========================
-// User Configuration
-// ========================
+#if __has_include("esp_arduino_version.h")
+#include "esp_arduino_version.h"
+#endif
+
+// Edit these before flashing.
 const char *WIFI_SSID = "YOUR_WIFI_SSID";
-const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
-const char *SERVER_HOST = "YOUR_SERVER_HOST_OR_IP";
-const uint16_t SERVER_PORT = 4000;
-const char *SERVER_PATH = "/api/v1/device/upload";
-
-// Set true if your endpoint is HTTPS.
-const bool USE_HTTPS = false;
-// Only used when USE_HTTPS = true.
-const bool ALLOW_INSECURE_TLS = true;
-
-const char *DEVICE_KEY = "change-me";
-const char *DEVICE_ID = "esp32cam-01";
-
-const unsigned long UPLOAD_INTERVAL_MS = 15000;
-const unsigned long MAX_BACKOFF_MS = 120000;
-const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
-const unsigned long RESPONSE_TIMEOUT_MS = 15000;
-
-// ========================
-// AI Thinker ESP32-CAM Pins
-// ========================
+// AI Thinker ESP32-CAM pin map.
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM 0
@@ -46,300 +29,238 @@ const unsigned long RESPONSE_TIMEOUT_MS = 15000;
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
-unsigned long nextUploadAtMs = 0;
-uint8_t failureStreak = 0;
+static httpd_handle_t cameraHttpd = NULL;
 
-bool timeReached(unsigned long targetMs) {
-  return (long)(millis() - targetMs) >= 0;
+static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
+static const char *STREAM_BOUNDARY = "\r\n--frame\r\n";
+static const char *STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+void addCorsHeaders(httpd_req_t *req) {
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, OPTIONS");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 }
 
-bool connectWifi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    return true;
+esp_err_t optionsHandler(httpd_req_t *req) {
+  addCorsHeaders(req);
+  return httpd_resp_send(req, NULL, 0);
+}
+
+String frameSizeName(framesize_t size) {
+  switch (size) {
+    case FRAMESIZE_QQVGA: return "QQVGA";
+    case FRAMESIZE_QVGA: return "QVGA";
+    case FRAMESIZE_VGA: return "VGA";
+    case FRAMESIZE_SVGA: return "SVGA";
+    case FRAMESIZE_XGA: return "XGA";
+    case FRAMESIZE_SXGA: return "SXGA";
+    case FRAMESIZE_UXGA: return "UXGA";
+    default: return "UNKNOWN";
+  }
+}
+
+esp_err_t statusHandler(httpd_req_t *req) {
+  addCorsHeaders(req);
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"ssid\":\"" + String(WiFi.SSID()) + "\",";
+  json += "\"wifi\":\"" + String(WiFi.RSSI()) + " dBm\",";
+  json += "\"framesize\":\"" + frameSizeName((framesize_t)sensor->status.framesize) + "\",";
+  json += "\"quality\":" + String(sensor->status.quality);
+  json += "}";
+
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, json.c_str(), json.length());
+}
+
+esp_err_t captureHandler(httpd_req_t *req) {
+  addCorsHeaders(req);
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
   }
 
-  Serial.print("WiFi connecting to ");
-  Serial.println(WIFI_SSID);
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=esp32cam-capture.jpg");
+  esp_err_t result = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  return result;
+}
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+esp_err_t streamHandler(httpd_req_t *req) {
+  addCorsHeaders(req);
 
-  unsigned long started = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - started > WIFI_CONNECT_TIMEOUT_MS) {
-      Serial.println("WiFi connect timeout");
-      return false;
+  esp_err_t result = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+  if (result != ESP_OK) {
+    return result;
+  }
+
+  char partBuffer[72];
+  while (true) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera frame capture failed");
+      return ESP_FAIL;
     }
-    delay(300);
+
+    size_t headerLength = snprintf(partBuffer, sizeof(partBuffer), STREAM_PART, fb->len);
+    result = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+    if (result == ESP_OK) {
+      result = httpd_resp_send_chunk(req, partBuffer, headerLength);
+    }
+    if (result == ESP_OK) {
+      result = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+    }
+
+    esp_camera_fb_return(fb);
+    if (result != ESP_OK) {
+      break;
+    }
+
+    delay(80);
+  }
+
+  return result;
+}
+
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+#else
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+#endif
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+  } else {
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return false;
+  }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  sensor->set_vflip(sensor, 1);
+  sensor->set_brightness(sensor, 0);
+  sensor->set_saturation(sensor, 0);
+  return true;
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("Connecting to Wi-Fi: %s", WIFI_SSID);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
     Serial.print(".");
   }
 
   Serial.println();
-  Serial.print("WiFi connected. IP: ");
+  Serial.print("Camera ready at http://");
   Serial.println(WiFi.localIP());
-  return true;
 }
 
-void syncClock() {
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.max_uri_handlers = 8;
+  config.lru_purge_enable = true;
+  config.uri_match_fn = httpd_uri_match_wildcard;
 
-  unsigned long started = millis();
-  time_t now = time(nullptr);
+  httpd_uri_t statusUri = {
+    .uri = "/status",
+    .method = HTTP_GET,
+    .handler = statusHandler,
+    .user_ctx = NULL
+  };
 
-  while (now < 24 * 3600) {
-    if (millis() - started > 15000) {
-      Serial.println("NTP sync timeout, using fallback timestamp");
-      return;
-    }
-    delay(300);
-    now = time(nullptr);
+  httpd_uri_t captureUri = {
+    .uri = "/capture",
+    .method = HTTP_GET,
+    .handler = captureHandler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t streamUri = {
+    .uri = "/stream",
+    .method = HTTP_GET,
+    .handler = streamHandler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t optionsUri = {
+    .uri = "/*",
+    .method = HTTP_OPTIONS,
+    .handler = optionsHandler,
+    .user_ctx = NULL
+  };
+
+  if (httpd_start(&cameraHttpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(cameraHttpd, &statusUri);
+    httpd_register_uri_handler(cameraHttpd, &captureUri);
+    httpd_register_uri_handler(cameraHttpd, &streamUri);
+    httpd_register_uri_handler(cameraHttpd, &optionsUri);
   }
-
-  Serial.println("NTP sync OK");
-}
-
-void buildIso8601(char *out, size_t outSize) {
-  time_t now = time(nullptr);
-  if (now < 24 * 3600) {
-    snprintf(out, outSize, "1970-01-01T00:00:00Z");
-    return;
-  }
-
-  struct tm tmUtc;
-  gmtime_r(&now, &tmUtc);
-  strftime(out, outSize, "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
-}
-
-bool initCamera() {
-  camera_config_t cfg;
-  cfg.ledc_channel = LEDC_CHANNEL_0;
-  cfg.ledc_timer = LEDC_TIMER_0;
-  cfg.pin_d0 = Y2_GPIO_NUM;
-  cfg.pin_d1 = Y3_GPIO_NUM;
-  cfg.pin_d2 = Y4_GPIO_NUM;
-  cfg.pin_d3 = Y5_GPIO_NUM;
-  cfg.pin_d4 = Y6_GPIO_NUM;
-  cfg.pin_d5 = Y7_GPIO_NUM;
-  cfg.pin_d6 = Y8_GPIO_NUM;
-  cfg.pin_d7 = Y9_GPIO_NUM;
-  cfg.pin_xclk = XCLK_GPIO_NUM;
-  cfg.pin_pclk = PCLK_GPIO_NUM;
-  cfg.pin_vsync = VSYNC_GPIO_NUM;
-  cfg.pin_href = HREF_GPIO_NUM;
-  cfg.pin_sccb_sda = SIOD_GPIO_NUM;
-  cfg.pin_sccb_scl = SIOC_GPIO_NUM;
-  cfg.pin_pwdn = PWDN_GPIO_NUM;
-  cfg.pin_reset = RESET_GPIO_NUM;
-  cfg.xclk_freq_hz = 20000000;
-  cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size = psramFound() ? FRAMESIZE_VGA : FRAMESIZE_QVGA;
-  cfg.jpeg_quality = psramFound() ? 12 : 15;
-  cfg.fb_count = psramFound() ? 2 : 1;
-
-  esp_err_t err = esp_camera_init(&cfg);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed: 0x%x\n", err);
-    return false;
-  }
-
-  return true;
-}
-
-int parseStatusCode(const String &statusLine) {
-  int firstSpace = statusLine.indexOf(' ');
-  if (firstSpace < 0) {
-    return 0;
-  }
-
-  int secondSpace = statusLine.indexOf(' ', firstSpace + 1);
-  String code = secondSpace > firstSpace
-                  ? statusLine.substring(firstSpace + 1, secondSpace)
-                  : statusLine.substring(firstSpace + 1);
-  return code.toInt();
-}
-
-template <typename TClient>
-int sendMultipart(TClient &client, camera_fb_t *fb) {
-  char capturedAt[32];
-  buildIso8601(capturedAt, sizeof(capturedAt));
-
-  String boundary = "----esp32cam";
-  boundary += String((uint32_t)esp_random(), HEX);
-
-  String partDevice =
-    "--" + boundary + "\r\n"
-    "Content-Disposition: form-data; name=\"device_id\"\r\n\r\n" +
-    String(DEVICE_ID) + "\r\n";
-
-  String partCaptured =
-    "--" + boundary + "\r\n"
-    "Content-Disposition: form-data; name=\"captured_at\"\r\n\r\n" +
-    String(capturedAt) + "\r\n";
-
-  String partImageHeader =
-    "--" + boundary + "\r\n"
-    "Content-Disposition: form-data; name=\"image\"; filename=\"frame.jpg\"\r\n"
-    "Content-Type: image/jpeg\r\n\r\n";
-
-  String tail = "\r\n--" + boundary + "--\r\n";
-
-  size_t contentLength =
-    partDevice.length() + partCaptured.length() + partImageHeader.length() + fb->len + tail.length();
-
-  client.setTimeout(RESPONSE_TIMEOUT_MS);
-
-  client.print("POST ");
-  client.print(SERVER_PATH);
-  client.println(" HTTP/1.1");
-  client.print("Host: ");
-  client.print(SERVER_HOST);
-  client.print(":");
-  client.println(SERVER_PORT);
-  client.println("Connection: close");
-  client.print("x-device-key: ");
-  client.println(DEVICE_KEY);
-  client.print("x-device-id: ");
-  client.println(DEVICE_ID);
-  client.print("Content-Type: multipart/form-data; boundary=");
-  client.println(boundary);
-  client.print("Content-Length: ");
-  client.println(contentLength);
-  client.println();
-
-  client.print(partDevice);
-  client.print(partCaptured);
-  client.print(partImageHeader);
-
-  size_t written = client.write(fb->buf, fb->len);
-  if (written != fb->len) {
-    Serial.println("Write image payload failed");
-    return 0;
-  }
-
-  client.print(tail);
-
-  unsigned long started = millis();
-  while (!client.available()) {
-    if (millis() - started > RESPONSE_TIMEOUT_MS) {
-      Serial.println("Response timeout");
-      return 0;
-    }
-
-    if (!client.connected()) {
-      break;
-    }
-    delay(10);
-  }
-
-  if (!client.available()) {
-    return 0;
-  }
-
-  String statusLine = client.readStringUntil('\n');
-  statusLine.trim();
-  int statusCode = parseStatusCode(statusLine);
-  Serial.print("HTTP status: ");
-  Serial.println(statusCode);
-  return statusCode;
-}
-
-int uploadFrameOnce() {
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    return 0;
-  }
-
-  int statusCode = 0;
-
-  if (USE_HTTPS) {
-    WiFiClientSecure client;
-    if (ALLOW_INSECURE_TLS) {
-      client.setInsecure();
-    }
-
-    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
-      Serial.println("TLS connect failed");
-      esp_camera_fb_return(fb);
-      return 0;
-    }
-
-    statusCode = sendMultipart(client, fb);
-    client.stop();
-  } else {
-    WiFiClient client;
-    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
-      Serial.println("TCP connect failed");
-      esp_camera_fb_return(fb);
-      return 0;
-    }
-
-    statusCode = sendMultipart(client, fb);
-    client.stop();
-  }
-
-  esp_camera_fb_return(fb);
-  return statusCode;
-}
-
-unsigned long computeNextDelayMs() {
-  unsigned long delayMs = UPLOAD_INTERVAL_MS;
-  for (uint8_t i = 0; i < failureStreak; i++) {
-    if (delayMs >= MAX_BACKOFF_MS / 2) {
-      delayMs = MAX_BACKOFF_MS;
-      break;
-    }
-    delayMs *= 2;
-  }
-  return delayMs;
-}
-
-void scheduleNextAttempt() {
-  nextUploadAtMs = millis() + computeNextDelayMs();
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("Booting ESP32-CAM uploader");
+  Serial.setDebugOutput(false);
+  Serial.println();
 
   if (!initCamera()) {
-    while (true) {
-      delay(1000);
-    }
+    Serial.println("Restarting after camera init failure");
+    delay(3000);
+    ESP.restart();
   }
 
-  connectWifi();
-  syncClock();
-  nextUploadAtMs = millis() + 3000;
+  connectWiFi();
+  startCameraServer();
 }
 
 void loop() {
-  if (!timeReached(nextUploadAtMs)) {
-    delay(50);
-    return;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi disconnected; reconnecting");
+    connectWiFi();
   }
 
-  if (!connectWifi()) {
-    if (failureStreak < 6) {
-      failureStreak += 1;
-    }
-    scheduleNextAttempt();
-    return;
-  }
-
-  int statusCode = uploadFrameOnce();
-  bool ok = statusCode >= 200 && statusCode < 300;
-
-  if (ok) {
-    failureStreak = 0;
-    Serial.println("UPLOAD_OK");
-  } else {
-    if (failureStreak < 6) {
-      failureStreak += 1;
-    }
-    Serial.println("UPLOAD_FAIL");
-  }
-
-  scheduleNextAttempt();
+  delay(1000);
 }
