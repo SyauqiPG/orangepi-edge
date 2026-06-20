@@ -41,7 +41,6 @@ test("deployment-smoke", { concurrency: false }, async (t) => {
     assert.equal(typeof body.status, "string")
     assert.equal(typeof body.mode, "string")
     assert.equal(typeof body.db_path, "string")
-    assert.equal(typeof body.inference_interval_ms, "number")
     assert.equal(typeof body.auto_water_cooldown_ms, "number")
     assert.ok(["online", "offline"].includes(body.status))
     assert.ok(["auto", "manual"].includes(body.mode))

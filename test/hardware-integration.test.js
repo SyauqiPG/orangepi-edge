@@ -13,8 +13,9 @@ const {
   createServer,
   isWithinDaylightWindow,
 } = require("../src/server")
+const { createFrame } = require("../src/esp32cam/simulator")
 
-const JPEG_BYTES = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9])
+const JPEG_BYTES = createFrame(new Date("2026-06-21T01:00:00.000Z"))
 
 function createRuntime(configOverrides = {}) {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "orangepi-edge-hw-test-"))
@@ -24,7 +25,7 @@ function createRuntime(configOverrides = {}) {
     SNAPSHOT_IMAGE_BASE_PATH: "/uploads",
     DEVICE_UPLOAD_KEY: "test-device-key",
     CORS_ORIGIN: "*",
-    MODEL_PROVIDER: "mock",
+    MODEL_PROVIDER: "onnx",
     PUMP_DRY_RUN: true,
     APP_TIMEZONE: "Asia/Jakarta",
     ...configOverrides,
@@ -86,7 +87,7 @@ function sqliteRun(dbPath, sql, params = []) {
 test("POST /api/v1/camera/snap pulls image from ESP32-CAM and analyzes it", async (t) => {
   const camera = await startCameraServer((req, res) => {
     res.writeHead(200, { "content-type": "image/jpeg" })
-    res.end(JPEG_BYTES)
+    JPEG_BYTES.then((buffer) => res.end(buffer))
   })
   const { runtime, tempRoot } = createRuntime({ ESP32_CAM_BASE_URL: camera.baseUrl })
   t.after(async () => {
@@ -117,6 +118,20 @@ test("POST /api/v1/camera/snap reports camera failures", async (t) => {
   const response = await request(runtime.app).post("/api/v1/camera/snap").expect(502)
 
   assert.match(response.body.detail, /HTTP 503/)
+})
+
+test("snapshot is unavailable until a real image has been inferred", async (t) => {
+  const { runtime, tempRoot } = createRuntime()
+  t.after(async () => {
+    await cleanup(runtime, tempRoot)
+  })
+
+  await runtime.ensureInitialized()
+  const snapshot = await request(runtime.app).get("/api/v1/snapshot").expect(404)
+  const history = await request(runtime.app).get("/api/v1/inference/history").expect(200)
+
+  assert.equal(snapshot.body.error, "No inference available")
+  assert.deepEqual(history.body.history, [])
 })
 
 test("manual watering dry-run cancels the next automatic watering when under 6 hours", async (t) => {
@@ -189,7 +204,7 @@ test("automatic watering skips when rain was detected today", async (t) => {
 test("scheduled auto snap only runs inside daylight hours", async (t) => {
   const camera = await startCameraServer((req, res) => {
     res.writeHead(200, { "content-type": "image/jpeg" })
-    res.end(JPEG_BYTES)
+    JPEG_BYTES.then((buffer) => res.end(buffer))
   })
   const { runtime, tempRoot } = createRuntime({
     ESP32_CAM_BASE_URL: camera.baseUrl,
@@ -216,7 +231,7 @@ test("retention cleanup removes uploads and inference rows older than 7 days", a
 
   await runtime.ensureInitialized()
   const oldFile = path.join(tempRoot, "uploads", "old.jpg")
-  fs.writeFileSync(oldFile, JPEG_BYTES)
+  fs.writeFileSync(oldFile, await JPEG_BYTES)
   await sqliteRun(
     runtime.config.DB_PATH,
     "INSERT INTO image_uploads (device_id, image_path, captured_at, uploaded_at) VALUES ('test', '/uploads/old.jpg', ?, ?)",

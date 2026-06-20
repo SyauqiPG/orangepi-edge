@@ -67,6 +67,9 @@ function loadConfig() {
     .map((provider) => provider.trim())
     .filter(Boolean)
 
+  const ESP32_CAM_SIMULATOR = parseBoolean(process.env.ESP32_CAM_SIMULATOR, false)
+  const ESP32_CAM_SIMULATOR_PORT = parseNumber(process.env.ESP32_CAM_SIMULATOR_PORT, 8081)
+
   return {
     ROOT_DIR,
     PORT: parseNumber(process.env.PORT, 4000),
@@ -78,12 +81,17 @@ function loadConfig() {
       path.join("data", "uploads")
     ),
     SNAPSHOT_IMAGE_BASE_PATH: process.env.SNAPSHOT_IMAGE_BASE_PATH || "/uploads",
-    INFERENCE_INTERVAL_MS: parseNumber(process.env.INFERENCE_INTERVAL_MS, 25_000),
     AUTO_WATER_COOLDOWN_MS: parseNumber(process.env.AUTO_WATER_COOLDOWN_MS, 120_000),
     CORS_ORIGIN: process.env.CORS_ORIGIN || "*",
     DEVICE_UPLOAD_KEY: process.env.DEVICE_UPLOAD_KEY || "",
     MAX_UPLOAD_BYTES: parseNumber(process.env.MAX_UPLOAD_BYTES, 2 * 1024 * 1024),
-    ESP32_CAM_BASE_URL: (process.env.ESP32_CAM_BASE_URL || "").replace(/\/+$/, ""),
+    ESP32_CAM_BASE_URL: (
+      ESP32_CAM_SIMULATOR
+        ? `http://127.0.0.1:${ESP32_CAM_SIMULATOR_PORT}`
+        : process.env.ESP32_CAM_BASE_URL || ""
+    ).replace(/\/+$/, ""),
+    ESP32_CAM_SIMULATOR,
+    ESP32_CAM_SIMULATOR_PORT,
     ESP32_CAM_TIMEOUT_MS: parseNumber(process.env.ESP32_CAM_TIMEOUT_MS, 15_000),
     IMAGE_RETENTION_DAYS: parseNumber(process.env.IMAGE_RETENTION_DAYS, 7),
     APP_TIMEZONE: process.env.APP_TIMEZONE || "Asia/Jakarta",
@@ -109,7 +117,6 @@ function loadConfig() {
     ONNX_INDEX_NO_RAIN: parseNumber(process.env.ONNX_INDEX_NO_RAIN, 0),
     ONNX_INDEX_RAIN: parseNumber(process.env.ONNX_INDEX_RAIN, 1),
     ONNX_EXECUTION_PROVIDERS: onnxProviders,
-    ONNX_FALLBACK_TO_MOCK: String(process.env.ONNX_FALLBACK_TO_MOCK || "true").toLowerCase() !== "false",
   }
 }
 

@@ -8,6 +8,7 @@ const test = require("node:test")
 const request = require("supertest")
 
 const { createServer } = require("../src/server")
+const { createFrame } = require("../src/esp32cam/simulator")
 
 function createRuntime() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "orangepi-edge-test-"))
@@ -18,7 +19,7 @@ function createRuntime() {
     SNAPSHOT_IMAGE_BASE_PATH: "/uploads",
     DEVICE_UPLOAD_KEY: "test-device-key",
     CORS_ORIGIN: "*",
-    MODEL_PROVIDER: "mock",
+    MODEL_PROVIDER: "onnx",
   })
 
   return {
@@ -46,11 +47,10 @@ test("GET /api/v1/health returns parity fields", async (t) => {
   assert.equal(typeof response.body.status, "string")
   assert.equal(typeof response.body.mode, "string")
   assert.equal(typeof response.body.db_path, "string")
-  assert.equal(typeof response.body.inference_interval_ms, "number")
   assert.equal(typeof response.body.auto_water_cooldown_ms, "number")
 })
 
-test("GET /api/v1/snapshot returns parity schema", async (t) => {
+test("GET /api/v1/snapshot requires a real camera image", async (t) => {
   const { runtime, tempRoot } = createRuntime()
   t.after(async () => {
     await cleanup(runtime, tempRoot)
@@ -58,18 +58,8 @@ test("GET /api/v1/snapshot returns parity schema", async (t) => {
 
   await runtime.ensureInitialized()
 
-  const response = await request(runtime.app).get("/api/v1/snapshot").expect(200)
-
-  const keys = Object.keys(response.body).sort()
-  assert.deepEqual(keys, [
-    "description_text",
-    "image_path",
-    "mode",
-    "prediction_confidence",
-    "prediction_label",
-    "status",
-    "updated_at",
-  ])
+  const response = await request(runtime.app).get("/api/v1/snapshot").expect(404)
+  assert.equal(response.body.error, "No inference available")
 })
 
 test("PUT /api/v1/mode rejects invalid mode", async (t) => {
@@ -139,7 +129,7 @@ test("POST /api/v1/device/upload stores image and returns snapshot", async (t) =
     .set("x-device-key", "test-device-key")
     .set("x-device-id", "esp32cam-01")
     .field("captured_at", "2026-04-18T10:00:00.000Z")
-    .attach("image", Buffer.from([0xff, 0xd8, 0xff, 0xd9]), "frame.jpg")
+    .attach("image", await createFrame(new Date("2026-04-18T10:00:00.000Z")), "frame.jpg")
     .expect(201)
 
   assert.equal(response.body.ok, true)

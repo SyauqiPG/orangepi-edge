@@ -59,9 +59,10 @@ Important:
 
 - `DEVICE_UPLOAD_KEY` secures ESP32-CAM upload route via `x-device-key` header.
 - `ESP32_CAM_BASE_URL` points to the ESP32-CAM capture server, for example `http://192.168.1.100`.
+- `ESP32_CAM_SIMULATOR=true` starts a local ESP32-CAM-compatible server and overrides `ESP32_CAM_BASE_URL` with `http://127.0.0.1:${ESP32_CAM_SIMULATOR_PORT}`.
 - `PUMP_DRY_RUN=true` keeps watering commands in dry-run mode. Set it to `false` and provide `PUMP_ON_COMMAND` / `PUMP_OFF_COMMAND` for the GPIO relay.
 - `MODEL_PROVIDER=onnx` uses direct ONNX Runtime inference.
-- If ONNX loading or execution fails and `ONNX_FALLBACK_TO_MOCK=true`, service falls back to simulated inference.
+- ONNX loading and inference errors are returned directly; predictions are never synthesized.
 
 ## ONNX Model Setup
 
@@ -158,6 +159,19 @@ curl -X POST http://localhost:4000/api/v1/camera/snap
 
 The scheduler also pulls from `/capture` every 10 minutes during local hours 08:00-16:00.
 
+### ESP32-CAM Simulator
+
+Enable the built-in simulator when camera hardware is unavailable:
+
+```env
+ESP32_CAM_SIMULATOR=true
+ESP32_CAM_SIMULATOR_PORT=8081
+```
+
+It mirrors the sketch's `GET /status`, `GET /capture`, `GET /stream`, and wildcard
+`OPTIONS` behavior. Capture and stream frames are VGA JPEG images with the current
+`APP_TIMEZONE` date and time centered in `dd/mm/yyyy - hh:mm:ss.ms` format.
+
 ## Upload Fallback (HTTP multipart)
 
 - Endpoint: `POST /api/v1/device/upload`
@@ -195,6 +209,7 @@ docker compose up -d --build
 ## Notes
 
 - Uploaded images are served from `/uploads/<filename>`.
+- Inference runs only after a real ESP32-CAM capture or device image upload. Before the first image, `GET /api/v1/snapshot` returns `404`.
 - Uploaded images and inference rows older than `IMAGE_RETENTION_DAYS` are removed automatically.
 - Automatic watering runs once daily at `auto_watering_time` and skips when any `rain_likely` inference exists since local midnight.
 - SQLite tables maintain mock parity for `system_state`, `inference_snapshots`, and `watering_logs`.

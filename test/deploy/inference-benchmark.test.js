@@ -43,7 +43,6 @@ function buildTestConfig() {
   return loadConfig({
     ONNX_MODEL_PATH: MODEL_PATH,
     ONNX_EXECUTION_PROVIDERS: "cpu",
-    ONNX_FALLBACK_TO_MOCK: false,
     ONNX_INPUT_WIDTH: 224,
     ONNX_INPUT_HEIGHT: 224,
     ONNX_INPUT_MEAN: 127.5,
