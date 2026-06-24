@@ -8,8 +8,8 @@
 #endif
 
 // Edit these before flashing.
-const char *WIFI_SSID = "Syauqi";
-const char *WIFI_PASSWORD = "Qwer1234#";
+const char *WIFI_SSID = "pocof4";
+const char *WIFI_PASSWORD = "chromecat123";
 
 // AI Thinker ESP32-CAM pin map.
 #define PWDN_GPIO_NUM 32
