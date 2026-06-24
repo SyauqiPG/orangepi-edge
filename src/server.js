@@ -9,6 +9,7 @@ const path = require("path")
 const sqlite3 = require("sqlite3").verbose()
 
 const { loadConfig } = require("./config")
+const { createEsp32CamSimulator } = require("./esp32cam/simulator")
 const { createOnnxInferenceEngine } = require("./inference/onnx")
 
 function ensureDirectory(targetPath) {
@@ -260,24 +261,6 @@ function toAbsoluteImagePath(config, imagePath) {
   return path.resolve(config.ROOT_DIR, imagePath)
 }
 
-function simulateInference(referenceTime = Date.now(), imagePath = "/sky-monitor.svg") {
-  const signal = (Math.sin(referenceTime / 60_000) + 1) / 2
-  const rainLikely = signal > 0.53
-
-  const confidence = rainLikely
-    ? clamp(0.6 + signal * 0.36, 0.5, 0.97)
-    : clamp(0.58 + (1 - signal) * 0.32, 0.5, 0.97)
-
-  const predictionLabel = rainLikely ? "rain_likely" : "rain_unlikely"
-
-  return {
-    imagePath,
-    predictionLabel,
-    predictionConfidence: Number(confidence.toFixed(3)),
-    descriptionText: buildDescription(predictionLabel, confidence),
-  }
-}
-
 async function runCommandInference(config, imagePath) {
   if (!config.MODEL_COMMAND) {
     throw new Error("MODEL_COMMAND is empty")
@@ -339,7 +322,7 @@ async function runCommandInference(config, imagePath) {
             : buildDescription(predictionLabel, predictionConfidence)
 
         resolve({
-          imagePath: parsed.image_path || imagePath || "/sky-monitor.svg",
+          imagePath,
           predictionLabel,
           predictionConfidence,
           descriptionText,
@@ -349,38 +332,26 @@ async function runCommandInference(config, imagePath) {
   })
 }
 
-async function runInference(config, referenceTime, imagePath, onnxEngine) {
+async function runInference(config, imagePath, onnxEngine) {
   if (config.MODEL_PROVIDER === "onnx") {
-    try {
-      if (!onnxEngine) {
-        throw new Error("ONNX engine is unavailable")
-      }
+    if (!onnxEngine) {
+      throw new Error("ONNX engine is unavailable")
+    }
 
-      const prediction = await onnxEngine.infer(toAbsoluteImagePath(config, imagePath))
-      return {
-        imagePath,
-        predictionLabel: prediction.predictionLabel,
-        predictionConfidence: prediction.predictionConfidence,
-        descriptionText: buildDescription(prediction.predictionLabel, prediction.predictionConfidence),
-      }
-    } catch (error) {
-      if (!config.ONNX_FALLBACK_TO_MOCK) {
-        throw error
-      }
-
-      console.warn("[orangepi-edge] ONNX inference failed, falling back to simulated inference:", error.message)
+    const prediction = await onnxEngine.infer(toAbsoluteImagePath(config, imagePath))
+    return {
+      imagePath,
+      predictionLabel: prediction.predictionLabel,
+      predictionConfidence: prediction.predictionConfidence,
+      descriptionText: buildDescription(prediction.predictionLabel, prediction.predictionConfidence),
     }
   }
 
   if (config.MODEL_PROVIDER === "command" && config.MODEL_COMMAND) {
-    try {
-      return await runCommandInference(config, imagePath)
-    } catch (error) {
-      console.warn("[orangepi-edge] Falling back to simulated inference:", error.message)
-    }
+    return runCommandInference(config, imagePath)
   }
 
-  return simulateInference(referenceTime, imagePath)
+  throw new Error(`Unsupported MODEL_PROVIDER=${config.MODEL_PROVIDER}`)
 }
 
 function createServer(configOverrides = {}) {
@@ -395,6 +366,12 @@ function createServer(configOverrides = {}) {
   let wateringInProgress = false
   let schedulerTimer = null
   let cleanupTimer = null
+  const esp32CamSimulator = config.ESP32_CAM_SIMULATOR
+    ? createEsp32CamSimulator({
+        port: config.ESP32_CAM_SIMULATOR_PORT,
+        timeZone: config.APP_TIMEZONE,
+      })
+    : null
 
   const app = express()
   app.use(cors({ origin: parseCorsOrigin(config.CORS_ORIGIN) }))
@@ -567,14 +544,16 @@ function createServer(configOverrides = {}) {
         )
         VALUES (1, 'online', 'auto', ?, ?, NULL, NULL, '07:00', NULL, NULL, NULL, NULL)
         `,
-        ["/sky-monitor.svg", timestamp]
+        ["", timestamp]
       )
     }
 
-    const latestSnapshot = await get("SELECT * FROM inference_snapshots ORDER BY id DESC LIMIT 1")
-    if (!latestSnapshot) {
-      await createAndPersistSnapshot()
-    }
+    const uploadPathPrefix = `${config.SNAPSHOT_IMAGE_BASE_PATH.replace(/\/+$/, "")}/%`
+    await run("DELETE FROM inference_snapshots WHERE image_path NOT LIKE ?", [uploadPathPrefix])
+    await run(
+      "UPDATE system_state SET image_path = '' WHERE image_path <> '' AND image_path NOT LIKE ?",
+      [uploadPathPrefix]
+    )
 
     await cleanupOldImagesAndRows()
   }
@@ -752,10 +731,15 @@ function createServer(configOverrides = {}) {
   async function createAndPersistSnapshot(referenceTime = Date.now(), preferredImagePath = null) {
     const state = await getState()
     const latestUploadedImagePath = await getLatestUploadedImagePath()
-    const selectedImagePath =
-      preferredImagePath || latestUploadedImagePath || state.image_path || "/sky-monitor.svg"
+    const selectedImagePath = preferredImagePath || latestUploadedImagePath || state.image_path
 
-    const inference = await runInference(config, referenceTime, selectedImagePath, onnxEngine)
+    if (!selectedImagePath) {
+      const error = new Error("No ESP32-CAM image is available for inference")
+      error.statusCode = 409
+      throw error
+    }
+
+    const inference = await runInference(config, selectedImagePath, onnxEngine)
     const updatedAt = new Date(referenceTime).toISOString()
 
     await run(
@@ -791,6 +775,10 @@ function createServer(configOverrides = {}) {
   }
 
   function snapshotToResponse(snapshot, state) {
+    if (!snapshot) {
+      return null
+    }
+
     return {
       status: state.status,
       mode: state.mode,
@@ -957,16 +945,11 @@ function createServer(configOverrides = {}) {
     return null
   }
 
-  async function refreshSnapshotIfNeeded(forceNew = false, preferredImagePath = null) {
+  async function refreshSnapshotIfNeeded(_forceNew = false, preferredImagePath = null) {
     const state = await getState()
     let snapshot = await getLatestSnapshot()
 
-    const shouldCreate =
-      forceNew ||
-      !snapshot ||
-      Date.now() - Date.parse(snapshot.updated_at) >= config.INFERENCE_INTERVAL_MS
-
-    if (shouldCreate) {
+    if (preferredImagePath) {
       snapshot = await createAndPersistSnapshot(Date.now(), preferredImagePath)
     }
 
@@ -1103,6 +1086,9 @@ function createServer(configOverrides = {}) {
 
   function startSchedulers() {
     if (!schedulerTimer) {
+      runScheduledTasks().catch((error) => {
+        console.warn("[orangepi-edge] Initial scheduled task failed:", error.message)
+      })
       schedulerTimer = setInterval(() => {
         runScheduledTasks().catch((error) => {
           console.warn("[orangepi-edge] Scheduled task failed:", error.message)
@@ -1178,7 +1164,6 @@ function createServer(configOverrides = {}) {
         status: state.status,
         mode: state.mode,
         db_path: config.DB_PATH,
-        inference_interval_ms: config.INFERENCE_INTERVAL_MS,
         auto_water_cooldown_ms: config.AUTO_WATER_COOLDOWN_MS,
         auto_watering_time: state.auto_watering_time,
         app_timezone: config.APP_TIMEZONE,
@@ -1193,6 +1178,13 @@ function createServer(configOverrides = {}) {
   app.get("/api/v1/snapshot", async (req, res, next) => {
     try {
       const snapshot = await refreshSnapshotIfNeeded(false)
+      if (!snapshot) {
+        res.status(404).json({
+          error: "No inference available",
+          detail: "Capture an ESP32-CAM image before requesting a snapshot.",
+        })
+        return
+      }
       res.json(snapshot)
     } catch (error) {
       next(error)
@@ -1360,8 +1352,8 @@ function createServer(configOverrides = {}) {
       const entry = await createWateringLog({
         description: toLogDescription("manual"),
         mode: "manual",
-        predictionLabel: snapshot.prediction_label,
-        predictionConfidence: snapshot.prediction_confidence,
+        predictionLabel: snapshot ? snapshot.prediction_label : null,
+        predictionConfidence: snapshot ? snapshot.prediction_confidence : null,
         note: config.PUMP_DRY_RUN
           ? "Manual TURN ON command from HMI executed in pump dry-run mode."
           : "Manual TURN ON command from HMI executed by GPIO relay command.",
@@ -1549,18 +1541,18 @@ function createServer(configOverrides = {}) {
     await ensureInitialized()
 
     if (config.MODEL_PROVIDER === "onnx") {
-      try {
-        await onnxEngine.warmup()
-      } catch (error) {
-        if (!config.ONNX_FALLBACK_TO_MOCK) {
-          throw error
-        }
-
-        console.warn("[orangepi-edge] ONNX warmup failed, service will use simulated fallback:", error.message)
-      }
+      await onnxEngine.warmup()
+    } else if (config.MODEL_PROVIDER !== "command") {
+      throw new Error(`Unsupported MODEL_PROVIDER=${config.MODEL_PROVIDER}`)
     }
 
-    return new Promise((resolve) => {
+    if (esp32CamSimulator) {
+      const simulatorServer = await esp32CamSimulator.start()
+      const simulatorAddress = simulatorServer.address()
+      config.ESP32_CAM_BASE_URL = `http://127.0.0.1:${simulatorAddress.port}`
+    }
+
+    return new Promise((resolve, reject) => {
       const server = app.listen(config.PORT, () => {
         console.log(`[orangepi-edge] Running on http://localhost:${config.PORT}`)
         console.log(`[orangepi-edge] SQLite database: ${config.DB_PATH}`)
@@ -1568,11 +1560,20 @@ function createServer(configOverrides = {}) {
         startSchedulers()
         resolve(server)
       })
+      server.once("error", async (error) => {
+        if (esp32CamSimulator) {
+          await esp32CamSimulator.close()
+        }
+        reject(error)
+      })
     })
   }
 
   async function closeDatabase() {
     stopSchedulers()
+    if (esp32CamSimulator) {
+      await esp32CamSimulator.close()
+    }
     return new Promise((resolve, reject) => {
       db.close((error) => {
         if (error) {
