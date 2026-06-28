@@ -8,7 +8,7 @@
 #endif
 
 // Edit these before flashing.
-const char *WIFI_SSID = "pocof4";
+const char *WIFI_SSID = "Orange WISP";
 const char *WIFI_PASSWORD = "chromecat123";
 
 // AI Thinker ESP32-CAM pin map.
